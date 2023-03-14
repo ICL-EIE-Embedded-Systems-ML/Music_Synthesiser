@@ -1,27 +1,100 @@
 #include <Arduino.h>
 #include <U8g2lib.h>
+#include <STM32FreeRTOS.h>
+#include <ES_CAN.h>
+
+//#define DISABLE_THREADS
+//#define DISABLE_ISRs
+//#define TEST_SCANKEYS
+
+//#undef DISABLE_THREADS
+//#undef DISABLE_ISRs
+//#undef TEST_SCANKEYS
+
+  volatile uint8_t keyArray[7];
+  SemaphoreHandle_t keyArrayMutex;
+
+  volatile int32_t currentStepSize;
+
+  volatile int note_idx=0;
+
+  QueueHandle_t msgInQ;
+  QueueHandle_t msgOutQ;
+
+  SemaphoreHandle_t CAN_TX_Semaphore;
+
+  SemaphoreHandle_t RX_MessageMutex;
+  uint32_t ID; uint8_t RX_Message[8]={0};
+
+  class Knob{
+    public:
+      Knob(){                     //constructor
+        tracker=0;
+        prevKnob_BA=0;
+        last_increment=true;
+      }
+
+      void increment(){
+        if (tracker<8){
+          tracker++;
+        }
+      }
+
+      void decrement(){
+        if (tracker>0){
+          tracker--;
+        }
+      }
+
+      void update(uint8_t readings){
+        if ((prevKnob_BA == 0b00 && readings == 0b01) || (prevKnob_BA == 0b11 && readings == 0b10)){
+            increment();
+            last_increment = true;
+        }
+        else if ((prevKnob_BA == 0b01 && readings == 0b00) || (prevKnob_BA == 0b10 && readings == 0b11)){
+            decrement();
+            last_increment=false;
+        }
+        else if((prevKnob_BA ^ readings) == 0b11){ //bitwise XOR on last 2 bits indicates impossible transitions
+          //Serial.println("impossible transition");
+          if (last_increment){increment();}
+          else{decrement();}
+        }
+        prevKnob_BA = readings;
+      }
+
+      int8_t read(){
+        return tracker;
+      }
+
+    private:
+    int8_t tracker;
+    uint8_t prevKnob_BA;
+    bool last_increment;
+  };
+
+  Knob knob3, knob2, knob1, knob0;
+  Knob knobs[4] = {knob3, knob2, knob1, knob0};
 
 //Constants
   const uint32_t interval = 100; //Display update interval
-  const double A = 440; 
-  const double twelfth_root_2 = 1.05946309436;
-  volatile int32_t currentStepSize;
-  const int32_t stepSizes[] = {
-    (int32_t) (4294967296.0 * A / (pow(twelfth_root_2, 9)) * 22000.0), // C
-    (int32_t) (4294967296.0 * A / (pow(twelfth_root_2, 8)) * 22000.0), // C#
-    (int32_t) (4294967296.0 * A / (pow(twelfth_root_2, 7)) * 22000.0), // D
-    (int32_t) (4294967296.0 * A / (pow(twelfth_root_2, 6)) * 22000.0), // D#
-    (int32_t) (4294967296.0 * A / (pow(twelfth_root_2, 5)) * 22000.0), // E
-    (int32_t) (4294967296.0 * A / (pow(twelfth_root_2, 4)) * 22000.0), // F
-    (int32_t) (4294967296.0 * A / (pow(twelfth_root_2, 3)) * 22000.0),  // F#
-    (int32_t) (4294967296.0 * A / (pow(twelfth_root_2, 2)) * 22000.0),  // G
-    (int32_t) (4294967296.0 * A / (pow(twelfth_root_2, 1)) * 22000.0),  // G#
-    (int32_t) (4294967296.0 * A / 22000.0),  // A
-    (int32_t) (4294967296.0 * A * pow(twelfth_root_2, 1) / 22000.0),  // A#
-    (int32_t) (4294967296.0 * A * pow(twelfth_root_2, 2) / 22000.0),  // B
-};
 
-  uint8_t keyArray[7];
+  const char* noteNames [] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+
+  const uint32_t stepSizes [] = {
+    51076057,
+    54113197,
+    57330935,
+    60740010,
+    64351799,
+    68178356,
+    72232452,
+    76527617,
+    81078186,
+    85899346,
+    91007187,
+    96418756
+  };
 
 //Pin definitions
   //Row select and enable
@@ -38,7 +111,7 @@
   const int OUT_PIN = D11;
 
   //Audio analogue out
-  const int OUTL_PIN = A;
+  const int OUTL_PIN = A4;
   const int OUTR_PIN = A3;
 
   //Joystick analogue in
@@ -64,6 +137,269 @@ void setOutMuxBit(const uint8_t bitIdx, const bool value) {
       digitalWrite(REN_PIN,HIGH);
       delayMicroseconds(2);
       digitalWrite(REN_PIN,LOW);
+}
+
+void setRow(uint8_t rowIdx){
+  digitalWrite(REN_PIN, LOW); // Disable row select enable
+  if (rowIdx<0 || rowIdx >=7){
+      Serial.println("Key Matrix row invalid, reading row 0:");
+      digitalWrite(RA0_PIN, LOW);
+      digitalWrite(RA1_PIN, LOW);
+      digitalWrite(RA2_PIN, LOW);
+  }
+  else{
+      digitalWrite(RA0_PIN, rowIdx & 0x01);
+      digitalWrite(RA1_PIN, rowIdx & 0x02);
+      digitalWrite(RA2_PIN, rowIdx & 0x04);
+  }
+  digitalWrite(REN_PIN, HIGH); // Enable row select enable
+}
+
+uint8_t readCols(){
+  uint8_t result = 0;
+  result |= digitalRead(C0_PIN) << 0;
+  result |= digitalRead(C1_PIN) << 1;
+  result |= digitalRead(C2_PIN) << 2;
+  result |= digitalRead(C3_PIN) << 3;
+  return result;
+}
+
+void sampleISR() {
+    static uint32_t phaseAcc = 0;
+    phaseAcc += currentStepSize;
+
+    int32_t Vout = (phaseAcc >> 24) - 128;
+    Vout = Vout >> (8 - knobs[0].read());
+    analogWrite(OUTL_PIN, Vout + 128);
+    analogWrite(OUTR_PIN, Vout + 128);
+}
+
+void CAN_RX_ISR (void) {
+	uint8_t RX_Message_ISR[8];
+	uint32_t ID;
+	CAN_RX(ID, RX_Message_ISR);
+	xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
+}
+
+void CAN_TX_ISR (void) {
+	xSemaphoreGiveFromISR(CAN_TX_Semaphore, NULL);
+}
+
+#ifndef TEST_SCANKEYS
+  void scanKeysTask(void * pvParameters) {
+    const TickType_t xFrequency = 20/portTICK_PERIOD_MS;
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    while(1){
+      vTaskDelayUntil( &xLastWakeTime, xFrequency );
+      static bool key_states[12] = {false};
+      static uint32_t localCurrentStepSize = 0;
+      uint8_t keyArrayPreCopy[7];
+
+      uint8_t TX_Message[8] = {0};
+      
+      for (int i = 0; i < 5; i++){      //for the first five rows of the matrix
+        setRow(i);
+        delayMicroseconds(3);
+        uint8_t keys = readCols();
+        keyArrayPreCopy[i]=keys;
+        if (i<3){                       //if this is a key row (rows 0-2)
+          for (int j = 0; j < 4; j++) {       // for every key (column of the matrix)
+            note_idx = i*4+j;
+            if ((keys & (1 << j)) == 0) {      // if jth column is LOW (key is pressed)
+              //localCurrentStepSize = stepSizes[note_idx];
+              if (!key_states[note_idx]){                            //if the key state has changed (pressed ro released)
+                localCurrentStepSize = stepSizes[note_idx];
+                  TX_Message[0] = 'P';
+                  TX_Message[1] = 4;
+                  TX_Message[2] = note_idx;
+                  key_states[note_idx] = true;
+                  xQueueSend( msgOutQ, TX_Message, portMAX_DELAY);
+              }
+            }
+            else {                          //if jth column is high (key is not pressed)
+              if (key_states[note_idx]){    // if the key used to be pressed, send release message
+                TX_Message[0] = 'R';
+                TX_Message[1] = 4;
+                TX_Message[2] = note_idx;
+                key_states[note_idx] = false;
+                xQueueSend( msgOutQ, TX_Message, portMAX_DELAY);
+                for (int k=11; k>=0; k--){
+                  if (key_states[k]){
+                    localCurrentStepSize = stepSizes[k];
+                    break;
+                  }
+                }
+              }
+            }
+          }
+          if (std::all_of(key_states, key_states+12, [](bool key){return !key;})){
+            localCurrentStepSize = 0;
+          }
+        }
+        else{
+          for (int j=0; j<2; j++){
+            uint8_t Knob_BA = ((keys >> (2*j)) & 0b11);
+            knobs[(i-3)*2+j].update(Knob_BA);
+          }
+        }
+      }
+      xSemaphoreTake(keyArrayMutex, portMAX_DELAY);
+      std::copy(keyArrayPreCopy, keyArrayPreCopy+7, keyArray);
+      xSemaphoreGive(keyArrayMutex);
+      __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
+    }
+  }
+#endif
+
+#ifdef TEST_SCANKEYS
+  void scanKeysTask() {
+    static bool key_states[12] = {false};
+    static uint32_t localCurrentStepSize = 0;
+    uint8_t keyArrayPreCopy[7];
+
+    uint8_t TX_Message[8] = {0};
+    
+    for (int i = 0; i < 5; i++){      //for the first five rows of the matrix
+      setRow(i);
+      delayMicroseconds(3);
+      uint8_t keys = readCols();
+      keyArrayPreCopy[i]=keys;
+      if (i<3){                       //if this is a key row (rows 0-2)
+        for (int j = 0; j < 4; j++) {       // for every key (column of the matrix)
+          note_idx = i*4+j;
+          if ((keys & (1 << j)) == 0) {      // if jth column is LOW (key is pressed)
+            //localCurrentStepSize = stepSizes[note_idx];
+            if (!key_states[note_idx]){                            //if the key state has changed (pressed ro released)
+              localCurrentStepSize = stepSizes[note_idx];
+                TX_Message[0] = 'P';
+                TX_Message[1] = 4;
+                TX_Message[2] = note_idx;
+                key_states[note_idx] = true;
+                xQueueSend( msgOutQ, TX_Message, portMAX_DELAY);
+            }
+//else added just for timing purposes
+            else{
+                TX_Message[0] = 'P';
+                TX_Message[1] = 4;
+                TX_Message[2] = note_idx;
+                key_states[note_idx] = true;
+                xQueueSend( msgOutQ, TX_Message, portMAX_DELAY);
+            }
+          }
+          else {                          //if jth column is high (key is not pressed)
+            if (key_states[note_idx]){    // if the key used to be pressed, send release message
+              TX_Message[0] = 'R';
+              TX_Message[1] = 4;
+              TX_Message[2] = note_idx;
+              key_states[note_idx] = false;
+              xQueueSend( msgOutQ, TX_Message, portMAX_DELAY);
+              for (int k=11; k>=0; k--){
+                if (key_states[k]){
+                  localCurrentStepSize = stepSizes[k];
+                  break;
+                }
+              }
+            }
+//else added just for timing purposes
+            else{
+                TX_Message[0] = 'R';
+                TX_Message[1] = 4;
+                TX_Message[2] = note_idx;
+                key_states[note_idx] = false;
+                xQueueSend( msgOutQ, TX_Message, portMAX_DELAY);
+            }
+          }
+        }
+        if (std::all_of(key_states, key_states+12, [](bool key){return !key;})){
+          localCurrentStepSize = 0;
+        }
+      }
+      else{
+        for (int j=0; j<2; j++){
+          uint8_t Knob_BA = ((keys >> (2*j)) & 0b11);
+          knobs[(i-3)*2+j].update(Knob_BA);
+        }
+      }
+    }
+    xSemaphoreTake(keyArrayMutex, portMAX_DELAY);
+    std::copy(keyArrayPreCopy, keyArrayPreCopy+7, keyArray);
+    xSemaphoreGive(keyArrayMutex);
+    __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
+  }
+#endif
+
+void displayUpdateTask(void * pvParameters){
+  const TickType_t xFrequency = 100/portTICK_PERIOD_MS;
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  while(1){
+    vTaskDelayUntil( &xLastWakeTime, xFrequency );
+    //Update display
+    uint8_t keyArrayCopy[7];
+
+    xSemaphoreTake(keyArrayMutex, portMAX_DELAY);
+    std::copy(keyArray, keyArray+7, keyArrayCopy);
+    Knob knob3_copy = knobs[0];
+    Knob knob2_copy = knobs[1];
+    Knob knob1_copy = knobs[2];
+    Knob knob0_copy = knobs[3];
+    xSemaphoreGive(keyArrayMutex);
+
+    u8g2.clearBuffer();         // clear the internal memory
+    u8g2.setFont(u8g2_font_ncenB08_tr); // choose a suitable font
+    u8g2.drawStr(2,10,"SIUU");  // write something to the internal memory
+    u8g2.setCursor(2,20);
+    u8g2.print(keyArrayCopy[2],HEX);
+    u8g2.setCursor(9,20);
+    u8g2.print(keyArrayCopy[1],HEX);
+    u8g2.setCursor(16,20);
+    u8g2.print(keyArrayCopy[0],HEX);
+    if (!(keyArrayCopy[2] == 0xf && keyArrayCopy[1] == 0xf && keyArrayCopy[0] == 0xf)){
+        u8g2.drawStr(2,30,noteNames[note_idx]);
+    }
+    u8g2.drawStr(45,10,"Vol: ");
+    u8g2.setCursor(70, 10);
+    u8g2.print(knob3_copy.read(), DEC);
+    u8g2.drawStr(85,10,"K2: ");
+    u8g2.setCursor(105, 10);
+    u8g2.print(knob2_copy.read(), DEC);
+    u8g2.drawStr(45,20,"K1: ");
+    u8g2.setCursor(70, 20);
+    u8g2.print(knob1_copy.read(), DEC);
+    u8g2.drawStr(85,20,"K0: ");
+    u8g2.setCursor(105, 20);
+    u8g2.print(knob0_copy.read(), DEC);
+
+    u8g2.setCursor(66,30);
+    xSemaphoreTake(RX_MessageMutex, portMAX_DELAY);
+    u8g2.print((char) RX_Message[0]);
+    u8g2.print(RX_Message[1]);
+    u8g2.print(RX_Message[2]);
+    xSemaphoreGive(RX_MessageMutex);
+    u8g2.sendBuffer();          // transfer internal memory to the display
+
+    //Toggle LED
+    digitalToggle(LED_BUILTIN);
+  }
+}
+
+void decodeTask(void * pvParameters){
+    while(1){
+        uint8_t RX_Message_precopy[8];
+        xQueueReceive(msgInQ, RX_Message, portMAX_DELAY);
+
+        xSemaphoreTake(RX_MessageMutex, portMAX_DELAY);
+        std::copy(RX_Message, RX_Message+8, RX_Message_precopy);
+        xSemaphoreGive(RX_MessageMutex);
+    }
+}
+
+void CAN_TX_Task (void * pvParameters) {
+	uint8_t msgOut[8];
+	while (1) {
+		xQueueReceive(msgOutQ, msgOut, portMAX_DELAY);
+		xSemaphoreTake(CAN_TX_Semaphore, portMAX_DELAY);
+		CAN_TX(0x123, msgOut);
+	}
 }
 
 void setup() {
@@ -96,64 +432,82 @@ void setup() {
   //Initialise UART
   Serial.begin(9600);
   Serial.println("Hello World");
-}
 
-uint8_t readCols(){
-  uint8_t result = 0;   
-  result |= digitalRead(C0_PIN) << 0;
-  result |= digitalRead(C1_PIN) << 1;
-  result |= digitalRead(C2_PIN) << 2;
-  result |= digitalRead(C3_PIN) << 3;
+  TIM_TypeDef *Instance = TIM1;
+  HardwareTimer *sampleTimer = new HardwareTimer(Instance);
 
-  return result;
-}
+  sampleTimer->setOverflow(22000, HERTZ_FORMAT);
+  sampleTimer->attachInterrupt(sampleISR);
+  sampleTimer->resume();
 
-void setRow(uint8_t rowIdx){
-  digitalWrite(REN_PIN, LOW); // Disable row select enable
-  digitalWrite(RA0_PIN, rowIdx & 0x01);
-  digitalWrite(RA1_PIN, rowIdx & 0x02);
-  digitalWrite(RA2_PIN, rowIdx & 0x04);
-  digitalWrite(REN_PIN, HIGH); // Enable row select enable
-}
+  CAN_Init(true);
+  setCANFilter(0x123,0x7ff);
+  #ifndef DISABLE_ISRs
+    CAN_RegisterRX_ISR(CAN_RX_ISR);
+    CAN_RegisterTX_ISR(CAN_TX_ISR);
+  #endif
+  CAN_Start();
 
-void scanSwitchMatrix(){
-  for(uint8_t row; row<3; row++){
-    setRow(row);
+  msgInQ = xQueueCreate(36,8);
+  msgOutQ = xQueueCreate(384,8);
 
-    delayMicroseconds(100); 
+  CAN_TX_Semaphore = xSemaphoreCreateCounting(3,3);
 
-    uint8_t cols = readCols();
-    keyArray[row] = cols; 
-  }
-}
+  #ifndef DISABLE_THREADS
+  TaskHandle_t scanKeysHandle = NULL;
+    xTaskCreate(
+      scanKeysTask,		/* Function that implements the task */
+      "scanKeys",		/* Text name for the task */
+      64,      		/* Stack size in words, not bytes */
+      NULL,			/* Parameter passed into the task */
+      2,			/* Task priority */
+      &scanKeysHandle );	/* Pointer to store the task handle */
 
-void loop() {
-  // put your main code here, to run repeatedly:
-  static uint32_t next = millis();
-  static uint32_t count = 0;
+  TaskHandle_t displayUpdateHandle = NULL;
+    xTaskCreate(
+      displayUpdateTask,		/* Function that implements the task */
+      "displayUpdate",		/* Text name for the task */
+      256,      		/* Stack size in words, not bytes */
+      NULL,			/* Parameter passed into the task */
+      1,			/* Task priority */
+      &displayUpdateHandle );	/* Pointer to store the task handle */
+
+  TaskHandle_t decodeHandle = NULL;
+    xTaskCreate(
+      decodeTask,		/* Function that implements the task */
+      "decode",		/* Text name for the task */
+      256,      		/* Stack size in words, not bytes */
+      NULL,			/* Parameter passed into the task */
+      1,			/* Task priority */
+      &decodeHandle );	/* Pointer to store the task handle */
+
+  TaskHandle_t CAN_TX_Handle = NULL;
+    xTaskCreate(
+      CAN_TX_Task,		/* Function that implements the task */
+      "CAN_TX_",		/* Text name for the task */
+      256,      		/* Stack size in words, not bytes */
+      NULL,			/* Parameter passed into the task */
+      1,			/* Task priority */
+      &CAN_TX_Handle );	/* Pointer to store the task handle */
+  #endif
   
-  if (millis() > next) {
-    next += interval;
+  keyArrayMutex = xSemaphoreCreateMutex();
+  RX_MessageMutex = xSemaphoreCreateMutex();
 
-    scanSwitchMatrix();
-    uint16_t hexData = (keyArray[2] << 8) | (keyArray[1] << 4) | keyArray[0];
-    Serial.print("Keys: ");
-    for (int i = 0; i < 3; i++) {
-      Serial.print(keyArray[i], HEX);
+  #ifndef DISABLE_THREADS
+  vTaskStartScheduler();
+  #endif
+
+  
+
+  #ifdef TEST_SCANKEYS
+    uint32_t startTime = micros();
+    for (int iter = 0; iter < 32; iter++) {
+      scanKeysTask();
     }
-    Serial.println();
-    //Update display
-    u8g2.clearBuffer();         // clear the internal memory
-    u8g2.setFont(u8g2_font_ncenB08_tr); // choose a suitable font
-    u8g2.drawStr(2,10,"Helllo World!");  // write something to the internal memory
-    u8g2.setCursor(2,20);
-    uint8_t keys = readCols();
-    u8g2.setCursor(2,20);
-    u8g2.print(keys,HEX); 
-    u8g2.sendBuffer();          // transfer internal memory to the display
-
-    //Toggle LED
-    digitalToggle(LED_BUILTIN);
-  }
-
+    Serial.println(micros()-startTime);
+    while(1);
+  #endif
 }
+
+void loop() {}
